@@ -1,39 +1,34 @@
+/**
+ * migrate.js — 数据库迁移脚本
+ * 每次 Railway 部署时自动运行，所有操作均幂等（已存在则跳过）
+ */
 const sqlite3 = require('sqlite3').verbose();
 const db = new sqlite3.Database('./prediction.db');
 
-db.serialize(() => {
-  // 添加用户身份字段
-  db.run(`ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'other'`, (err) => {
-    if (err) console.log('role字段已存在');
-    else console.log('✅ 添加用户身份字段');
+const runSQL = (sql, label) => new Promise((resolve) => {
+  db.run(sql, (err) => {
+    if (err) console.log(`⏭  跳过（已存在）: ${label}`);
+    else console.log(`✅ ${label}`);
+    resolve();
   });
+});
 
-  // 添加用户简介
-  db.run(`ALTER TABLE users ADD COLUMN bio TEXT`, (err) => {
-    if (err) console.log('bio字段已存在');
-    else console.log('✅ 添加用户简介字段');
-  });
+async function migrate() {
+  console.log('🚀 开始数据库迁移...\n');
+  // ── users 表
+  await runSQL(`ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'other'`, 'users.role');
+  await runSQL(`ALTER TABLE users ADD COLUMN bio TEXT`, 'users.bio');
+  await runSQL(`ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0`, 'users.is_admin');
 
-  // 添加话题分类
-  db.run(`ALTER TABLE topics ADD COLUMN category TEXT DEFAULT 'other'`, (err) => {
-    if (err) console.log('category字段已存在');
-    else console.log('✅ 添加话题分类字段');
-  });
+  // ── topics 表
+  await runSQL(`ALTER TABLE topics ADD COLUMN category TEXT DEFAULT 'other'`, 'topics.category');
+  await runSQL(`ALTER TABLE topics ADD COLUMN settlement_date TEXT`, 'topics.settlement_date');
+  await runSQL(`ALTER TABLE topics ADD COLUMN settlement_result TEXT`, 'topics.settlement_result');
+  await runSQL(`ALTER TABLE topics ADD COLUMN status TEXT DEFAULT 'active'`, 'topics.status');
+  await runSQL(`ALTER TABLE topics ADD COLUMN total_participants INTEGER DEFAULT 0`, 'topics.total_participants');
 
-  // 添加话题结算时间
-  db.run(`ALTER TABLE topics ADD COLUMN settlement_date TEXT`, (err) => {
-    if (err) console.log('settlement_date字段已存在');
-    else console.log('✅ 添加结算时间字段');
-  });
-
-  // 添加话题结算结果
-  db.run(`ALTER TABLE topics ADD COLUMN settlement_result TEXT`, (err) => {
-    if (err) console.log('settlement_result字段已存在');
-    else console.log('✅ 添加结算结果字段');
-  });
-
-  // 创建关注表
-  db.run(`CREATE TABLE IF NOT EXISTS follows (
+  // ── 新建表
+  await runSQL(`CREATE TABLE IF NOT EXISTS follows (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     follower_id INTEGER NOT NULL,
     following_id INTEGER NOT NULL,
@@ -41,28 +36,36 @@ db.serialize(() => {
     FOREIGN KEY (follower_id) REFERENCES users(id),
     FOREIGN KEY (following_id) REFERENCES users(id),
     UNIQUE(follower_id, following_id)
-  )`, (err) => {
-    if (err) console.log('follows表已存在');
-    else console.log('✅ 创建关注表');
-  });
+  )`, 'follows 表');
 
-  // 创建投票历史表（用于趋势图）
-  db.run(`CREATE TABLE IF NOT EXISTS vote_snapshots (
+  await runSQL(`CREATE TABLE IF NOT EXISTS vote_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     topic_id INTEGER NOT NULL,
     yes_votes INTEGER DEFAULT 0,
     no_votes INTEGER DEFAULT 0,
     snapshot_time DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (topic_id) REFERENCES topics(id)
-  )`, (err) => {
-    if (err) console.log('vote_snapshots表已存在');
-    else console.log('✅ 创建投票快照表');
-  });
+  )`, 'vote_snapshots 表');
 
-  console.log('\n🎉 数据库升级完成！');
-  
-  setTimeout(() => {
-    db.close();
-    process.exit(0);
-  }, 1000);
+  await runSQL(`CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    content TEXT NOT NULL,
+    topic_id INTEGER,
+    is_read INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  )`, 'notifications 表');
+
+  console.log('\n🎉 数据库迁移完成！\n');
+}
+
+migrate().then(() => {
+  db.close();
+  process.exit(0);
+}).catch((err) => {
+  console.error('❌ 迁移失败:', err);
+  db.close();
+  process.exit(1);
 });
