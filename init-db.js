@@ -6,7 +6,7 @@ const db = new sqlite3.Database('./prediction.db');
 async function initDatabase() {
   return new Promise((resolve, reject) => {
     db.serialize(async () => {
-      // 创建用户表
+      // 用户表
       db.run(`CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         email TEXT UNIQUE NOT NULL,
@@ -14,10 +14,11 @@ async function initDatabase() {
         credits INTEGER DEFAULT 1000,
         role TEXT DEFAULT 'other',
         bio TEXT,
+        is_admin INTEGER DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )`);
 
-      // 创建话题表
+      // 话题表
       db.run(`CREATE TABLE IF NOT EXISTS topics (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         title TEXT NOT NULL,
@@ -34,7 +35,7 @@ async function initDatabase() {
         FOREIGN KEY (creator_id) REFERENCES users(id)
       )`);
 
-      // 创建投票表
+      // 投票表
       db.run(`CREATE TABLE IF NOT EXISTS votes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         topic_id INTEGER,
@@ -47,7 +48,7 @@ async function initDatabase() {
         UNIQUE(topic_id, user_id)
       )`);
 
-      // 创建评论表
+      // 评论表
       db.run(`CREATE TABLE IF NOT EXISTS comments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         topic_id INTEGER,
@@ -58,7 +59,7 @@ async function initDatabase() {
         FOREIGN KEY (user_id) REFERENCES users(id)
       )`);
 
-      // 创建关注表
+      // 关注表
       db.run(`CREATE TABLE IF NOT EXISTS follows (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         follower_id INTEGER NOT NULL,
@@ -69,7 +70,7 @@ async function initDatabase() {
         UNIQUE(follower_id, following_id)
       )`);
 
-      // 创建投票快照表
+      // 投票快照表
       db.run(`CREATE TABLE IF NOT EXISTS vote_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         topic_id INTEGER NOT NULL,
@@ -77,12 +78,27 @@ async function initDatabase() {
         no_votes INTEGER DEFAULT 0,
         snapshot_time DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (topic_id) REFERENCES topics(id)
+      )`);
+
+      // 通知表
+      db.run(`CREATE TABLE IF NOT EXISTS notifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        type TEXT NOT NULL,
+        topic_id INTEGER,
+        from_user_id INTEGER,
+        message TEXT NOT NULL,
+        is_read INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        FOREIGN KEY (topic_id) REFERENCES topics(id),
+        FOREIGN KEY (from_user_id) REFERENCES users(id)
       )`, async (err) => {
-        if (err) {
-          reject(err);
-          return;
-        }
-        
+        if (err) { reject(err); return; }
+
+        // 迁移：给旧数据库添加 is_admin 字段（如果不存在）
+        db.run(`ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0`, () => {});
+
         // 检查是否已有数据
         db.get('SELECT COUNT(*) as count FROM users', async (err, row) => {
           if (err || row.count > 0) {
@@ -90,8 +106,6 @@ async function initDatabase() {
             resolve();
             return;
           }
-          
-          // 插入种子数据
           await insertSeedData();
           resolve();
         });
@@ -102,13 +116,11 @@ async function initDatabase() {
 
 async function insertSeedData() {
   const systemPassword = await bcrypt.hash('system123', 10);
-  
   return new Promise((resolve) => {
-    db.run(`INSERT INTO users (id, email, password, credits, role) VALUES (1, 'system@market.com', ?, 999999, 'other')`, 
-      [systemPassword], 
+    db.run(`INSERT INTO users (id, email, password, credits, role, is_admin) VALUES (1, 'system@market.com', ?, 999999, 'other', 1)`,
+      [systemPassword],
       () => {
-        console.log('✅ Created system user');
-        
+        console.log('✅ Created system user (admin)');
         const seedTopics = [
           { title: "2026年底之前会有多少家估值超过100亿人民币的机器人创业公司？", description: "考虑人形机器人、工业机器人、服务机器人等赛道，目前优必选、达闼等已接近或超过这个估值。", category: "valuation", yes_votes: 45, no_votes: 35 },
           { title: "燧原科技能否在2026年成功上市？", description: "燧原科技是国产AI芯片独角兽，已完成多轮融资。考虑当前市场环境和公司发展阶段。", category: "ipo", yes_votes: 38, no_votes: 42 },
@@ -121,11 +133,10 @@ async function insertSeedData() {
           { title: "蔚来汽车能在2026年底前实现单月交付5万辆吗？", description: "蔚来目前月交付2万辆左右，能否在2026年实现突破？", category: "trend", yes_votes: 48, no_votes: 32 },
           { title: "2026年VC市场会比2025年更活跃吗？", description: "考虑宏观经济、退出环境、募资情况等因素，一级市场是否会回暖？", category: "financing", yes_votes: 41, no_votes: 39 }
         ];
-        
         let completed = 0;
         seedTopics.forEach((topic) => {
           db.run(
-            `INSERT INTO topics (title, description, category, creator_id, yes_votes, no_votes, total_participants) 
+            `INSERT INTO topics (title, description, category, creator_id, yes_votes, no_votes, total_participants)
              VALUES (?, ?, ?, 1, ?, ?, ?)`,
             [topic.title, topic.description, topic.category, topic.yes_votes, topic.no_votes, topic.yes_votes + topic.no_votes],
             () => {
