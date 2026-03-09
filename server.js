@@ -607,6 +607,19 @@ app.get('/api/users/search', auth, (req, res) => {
   );
 });
 
+// ─── 初始化管理员（一次性接口，使用 ADMIN_INIT_KEY 环境变量保护）────────────────
+// 调用方式: POST /api/init-admin  body: { email, key }
+app.post('/api/init-admin', (req, res) => {
+  const { email, key } = req.body;
+  const ADMIN_KEY = process.env.ADMIN_INIT_KEY || 'init-admin-2026';
+  if (key !== ADMIN_KEY) return res.status(403).json({ error: '密钥错误' });
+  db.run('UPDATE users SET is_admin = 1 WHERE email = ?', [email], function(err) {
+    if (err) return res.status(500).json({ error: '操作失败' });
+    if (this.changes === 0) return res.status(404).json({ error: '用户不存在' });
+    res.json({ success: true, message: `${email} 已设置为管理员` });
+  });
+});
+
 // ─── 启动 ────────────────────────────────────────────────────────────────────
 
 initDatabase().then(() => {
