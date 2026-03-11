@@ -1,6 +1,6 @@
 /**
  * migrate.js — PostgreSQL 数据库迁移脚本
- * 每次 Railway 部署时自动运行，所有操作均幂等（IF NOT EXISTS）
+ * 每次 Railway 部署时自动运行，所有操作均幂等（IF NOT EXISTS / ADD COLUMN IF NOT EXISTS）
  */
 const { Pool } = require('pg');
 
@@ -14,6 +14,7 @@ const pool = new Pool({
 async function migrate() {
   console.log('🚀 开始数据库迁移...');
 
+  // ── users ──────────────────────────────────────────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
@@ -28,15 +29,18 @@ async function migrate() {
   `);
   console.log('✅ users 表');
 
+  // ── topics ─────────────────────────────────────────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS topics (
       id SERIAL PRIMARY KEY,
       title TEXT NOT NULL,
       description TEXT,
       category TEXT DEFAULT 'other',
-      yes_votes INTEGER DEFAULT 0,
-      no_votes INTEGER DEFAULT 0,
+      topic_type TEXT DEFAULT 'binary',
+      yes_votes NUMERIC DEFAULT 0,
+      no_votes NUMERIC DEFAULT 0,
       total_participants INTEGER DEFAULT 0,
+      total_pool NUMERIC DEFAULT 0,
       creator_id INTEGER REFERENCES users(id),
       settlement_date TEXT,
       status TEXT DEFAULT 'active',
@@ -44,21 +48,79 @@ async function migrate() {
       created_at TIMESTAMP DEFAULT NOW()
     )
   `);
+  // 补充旧表可能缺失的字段
+  await pool.query(`ALTER TABLE topics ADD COLUMN IF NOT EXISTS topic_type TEXT DEFAULT 'binary'`);
+  await pool.query(`ALTER TABLE topics ADD COLUMN IF NOT EXISTS total_pool NUMERIC DEFAULT 0`);
+  await pool.query(`ALTER TABLE topics ADD COLUMN IF NOT EXISTS yes_votes NUMERIC DEFAULT 0`);
+  await pool.query(`ALTER TABLE topics ADD COLUMN IF NOT EXISTS no_votes NUMERIC DEFAULT 0`);
   console.log('✅ topics 表');
 
+  // ── topic_options ──────────────────────────────────────────────────────────
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS topic_options (
+      id SERIAL PRIMARY KEY,
+      topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
+      label TEXT NOT NULL,
+      vote_count NUMERIC DEFAULT 0,
+      display_order INTEGER DEFAULT 0,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  console.log('✅ topic_options 表');
+
+  // ── votes ──────────────────────────────────────────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS votes (
       id SERIAL PRIMARY KEY,
       topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
       user_id INTEGER REFERENCES users(id),
       vote TEXT NOT NULL,
-      credits_spent INTEGER DEFAULT 10,
+      option_id INTEGER REFERENCES topic_options(id) ON DELETE SET NULL,
+      credits_spent NUMERIC DEFAULT 10,
+      shares NUMERIC DEFAULT 1,
+      avg_price NUMERIC DEFAULT 0.5,
+      is_closed INTEGER DEFAULT 0,
       created_at TIMESTAMP DEFAULT NOW(),
-      UNIQUE(topic_id, user_id)
+      updated_at TIMESTAMP DEFAULT NOW()
     )
+  `);
+  // 补充旧表可能缺失的字段
+  await pool.query(`ALTER TABLE votes ADD COLUMN IF NOT EXISTS option_id INTEGER REFERENCES topic_options(id) ON DELETE SET NULL`);
+  await pool.query(`ALTER TABLE votes ADD COLUMN IF NOT EXISTS shares NUMERIC DEFAULT 1`);
+  await pool.query(`ALTER TABLE votes ADD COLUMN IF NOT EXISTS avg_price NUMERIC DEFAULT 0.5`);
+  await pool.query(`ALTER TABLE votes ADD COLUMN IF NOT EXISTS is_closed INTEGER DEFAULT 0`);
+  await pool.query(`ALTER TABLE votes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()`);
+  // 移除旧的唯一约束（如果存在），允许同一用户追加投票
+  await pool.query(`
+    DO $$ BEGIN
+      IF EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'votes_topic_id_user_id_key'
+      ) THEN
+        ALTER TABLE votes DROP CONSTRAINT votes_topic_id_user_id_key;
+      END IF;
+    END $$
   `);
   console.log('✅ votes 表');
 
+  // ── trades ─────────────────────────────────────────────────────────────────
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS trades (
+      id SERIAL PRIMARY KEY,
+      topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
+      user_id INTEGER REFERENCES users(id),
+      vote_id INTEGER REFERENCES votes(id) ON DELETE SET NULL,
+      action TEXT NOT NULL DEFAULT 'open',
+      vote TEXT NOT NULL,
+      option_id INTEGER REFERENCES topic_options(id) ON DELETE SET NULL,
+      credits NUMERIC NOT NULL,
+      shares NUMERIC DEFAULT 1,
+      price NUMERIC NOT NULL DEFAULT 0.5,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  console.log('✅ trades 表');
+
+  // ── comments ───────────────────────────────────────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS comments (
       id SERIAL PRIMARY KEY,
@@ -70,6 +132,7 @@ async function migrate() {
   `);
   console.log('✅ comments 表');
 
+  // ── follows ────────────────────────────────────────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS follows (
       id SERIAL PRIMARY KEY,
@@ -81,17 +144,19 @@ async function migrate() {
   `);
   console.log('✅ follows 表');
 
+  // ── vote_snapshots ─────────────────────────────────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS vote_snapshots (
       id SERIAL PRIMARY KEY,
       topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
-      yes_votes INTEGER DEFAULT 0,
-      no_votes INTEGER DEFAULT 0,
+      yes_votes NUMERIC DEFAULT 0,
+      no_votes NUMERIC DEFAULT 0,
       snapshot_time TIMESTAMP DEFAULT NOW()
     )
   `);
   console.log('✅ vote_snapshots 表');
 
+  // ── notifications ──────────────────────────────────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS notifications (
       id SERIAL PRIMARY KEY,
@@ -105,49 +170,6 @@ async function migrate() {
     )
   `);
   console.log('✅ notifications 表');
-
-  // topic_options 表（多选项话题的选项）
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS topic_options (
-      id SERIAL PRIMARY KEY,
-      topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
-      label TEXT NOT NULL,
-      vote_count NUMERIC DEFAULT 0,
-      created_at TIMESTAMP DEFAULT NOW()
-    )
-  `);
-  console.log('✅ topic_options 表');
-
-  // trades 表（交易记录：建仓/追加/平仓）
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS trades (
-      id SERIAL PRIMARY KEY,
-      topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
-      user_id INTEGER REFERENCES users(id),
-      vote TEXT NOT NULL,
-      option_id INTEGER REFERENCES topic_options(id),
-      action TEXT NOT NULL DEFAULT 'open',
-      credits INTEGER NOT NULL,
-      price NUMERIC NOT NULL DEFAULT 0.5,
-      created_at TIMESTAMP DEFAULT NOW()
-    )
-  `);
-  console.log('✅ trades 表');
-
-  // 向 topics 表添加 topic_type 和 total_pool 字段（如果不存在）
-  await pool.query(`
-    ALTER TABLE topics ADD COLUMN IF NOT EXISTS topic_type TEXT DEFAULT 'binary'
-  `);
-  await pool.query(`
-    ALTER TABLE topics ADD COLUMN IF NOT EXISTS total_pool NUMERIC DEFAULT 0
-  `);
-  console.log('✅ topics.topic_type, topics.total_pool');
-
-  // 向 votes 表添加 option_id 字段
-  await pool.query(`
-    ALTER TABLE votes ADD COLUMN IF NOT EXISTS option_id INTEGER REFERENCES topic_options(id)
-  `);
-  console.log('✅ votes.option_id');
 
   console.log('🎉 数据库迁移完成！');
   await pool.end();
