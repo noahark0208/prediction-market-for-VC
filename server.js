@@ -320,6 +320,20 @@ app.get('/api/topics/:id', async (req, res) => {
   }
 });
 
+// 编辑话题（管理员）
+app.put('/api/topics/:id', adminAuth, async (req, res) => {
+  const { title, description, category, settlement_date } = req.body;
+  try {
+    await db.query(
+      'UPDATE topics SET title=$1, description=$2, category=$3, settlement_date=$4 WHERE id=$5',
+      [title, description, category, settlement_date, req.params.id]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: '更新失败' });
+  }
+});
+
 // 投票
 app.post('/api/topics/:id/vote', auth, async (req, res) => {
   const { vote } = req.body;
