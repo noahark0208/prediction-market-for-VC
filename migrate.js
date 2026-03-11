@@ -121,6 +121,10 @@ async function migrate() {
       created_at TIMESTAMP DEFAULT NOW()
     )
   `);
+  // 补充旧表可能缺失的字段
+  await pool.query(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS vote_id INTEGER REFERENCES votes(id) ON DELETE SET NULL`);
+  await pool.query(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS shares NUMERIC DEFAULT 1`);
+  await pool.query(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS option_id INTEGER REFERENCES topic_options(id) ON DELETE SET NULL`);
   console.log('✅ trades 表');
 
   // ── comments ───────────────────────────────────────────────────────────────
