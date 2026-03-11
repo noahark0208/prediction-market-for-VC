@@ -66,6 +66,9 @@ async function migrate() {
       created_at TIMESTAMP DEFAULT NOW()
     )
   `);
+  // 补充旧表可能缺失的字段
+  await pool.query(`ALTER TABLE topic_options ADD COLUMN IF NOT EXISTS display_order INTEGER DEFAULT 0`);
+  await pool.query(`ALTER TABLE topic_options ADD COLUMN IF NOT EXISTS vote_count NUMERIC DEFAULT 0`);
   console.log('✅ topic_options 表');
 
   // ── votes ──────────────────────────────────────────────────────────────────
