@@ -353,7 +353,8 @@ app.post('/api/topics', auth, async (req, res) => {
 
     res.json({ id: topicId, title, description, category, topic_type });
   } catch (err) {
-    res.status(500).json({ error: '创建失败' });
+    console.error('创建话题失败:', err.message, err.stack);
+    res.status(500).json({ error: '创建失败', detail: err.message });
   }
 });
 
