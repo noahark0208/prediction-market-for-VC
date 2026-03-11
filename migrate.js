@@ -106,6 +106,49 @@ async function migrate() {
   `);
   console.log('✅ notifications 表');
 
+  // topic_options 表（多选项话题的选项）
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS topic_options (
+      id SERIAL PRIMARY KEY,
+      topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
+      label TEXT NOT NULL,
+      vote_count NUMERIC DEFAULT 0,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  console.log('✅ topic_options 表');
+
+  // trades 表（交易记录：建仓/追加/平仓）
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS trades (
+      id SERIAL PRIMARY KEY,
+      topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
+      user_id INTEGER REFERENCES users(id),
+      vote TEXT NOT NULL,
+      option_id INTEGER REFERENCES topic_options(id),
+      action TEXT NOT NULL DEFAULT 'open',
+      credits INTEGER NOT NULL,
+      price NUMERIC NOT NULL DEFAULT 0.5,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  console.log('✅ trades 表');
+
+  // 向 topics 表添加 topic_type 和 total_pool 字段（如果不存在）
+  await pool.query(`
+    ALTER TABLE topics ADD COLUMN IF NOT EXISTS topic_type TEXT DEFAULT 'binary'
+  `);
+  await pool.query(`
+    ALTER TABLE topics ADD COLUMN IF NOT EXISTS total_pool NUMERIC DEFAULT 0
+  `);
+  console.log('✅ topics.topic_type, topics.total_pool');
+
+  // 向 votes 表添加 option_id 字段
+  await pool.query(`
+    ALTER TABLE votes ADD COLUMN IF NOT EXISTS option_id INTEGER REFERENCES topic_options(id)
+  `);
+  console.log('✅ votes.option_id');
+
   console.log('🎉 数据库迁移完成！');
   await pool.end();
 }

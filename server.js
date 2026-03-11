@@ -25,7 +25,6 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// PostgreSQL 连接池（Railway 自动注入 DATABASE_URL）
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('railway')
@@ -33,7 +32,6 @@ const pool = new Pool({
     : false
 });
 
-// 简化查询辅助函数
 const db = {
   query: (text, params) => pool.query(text, params),
   get: async (text, params) => {
@@ -53,6 +51,7 @@ const db = {
 // ─── 数据库初始化 ─────────────────────────────────────────────────────────────
 
 async function initDatabase() {
+  // 用户表
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
@@ -66,15 +65,18 @@ async function initDatabase() {
     )
   `);
 
+  // 话题表（新增 topic_type 字段：binary=二选一, multi=多选项）
   await pool.query(`
     CREATE TABLE IF NOT EXISTS topics (
       id SERIAL PRIMARY KEY,
       title TEXT NOT NULL,
       description TEXT,
       category TEXT DEFAULT 'other',
+      topic_type TEXT DEFAULT 'binary',
       yes_votes INTEGER DEFAULT 0,
       no_votes INTEGER DEFAULT 0,
       total_participants INTEGER DEFAULT 0,
+      total_pool INTEGER DEFAULT 0,
       creator_id INTEGER REFERENCES users(id),
       settlement_date TEXT,
       status TEXT DEFAULT 'active',
@@ -83,15 +85,48 @@ async function initDatabase() {
     )
   `);
 
+  // 多选项表（仅 multi 类型话题使用）
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS topic_options (
+      id SERIAL PRIMARY KEY,
+      topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
+      label TEXT NOT NULL,
+      vote_count INTEGER DEFAULT 0,
+      display_order INTEGER DEFAULT 0
+    )
+  `);
+
+  // 投票/持仓表（扩展：支持多选项、追加、平仓）
   await pool.query(`
     CREATE TABLE IF NOT EXISTS votes (
       id SERIAL PRIMARY KEY,
       topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
       user_id INTEGER REFERENCES users(id),
       vote TEXT NOT NULL,
+      option_id INTEGER REFERENCES topic_options(id) ON DELETE SET NULL,
       credits_spent INTEGER DEFAULT 10,
+      shares NUMERIC DEFAULT 1,
+      avg_price NUMERIC DEFAULT 0.5,
+      is_closed INTEGER DEFAULT 0,
       created_at TIMESTAMP DEFAULT NOW(),
-      UNIQUE(topic_id, user_id)
+      updated_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  // 交易记录表（每次追加/平仓都记录）
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS trades (
+      id SERIAL PRIMARY KEY,
+      topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
+      user_id INTEGER REFERENCES users(id),
+      vote_id INTEGER REFERENCES votes(id) ON DELETE CASCADE,
+      action TEXT NOT NULL,
+      vote TEXT NOT NULL,
+      option_id INTEGER,
+      credits INTEGER NOT NULL,
+      shares NUMERIC NOT NULL,
+      price NUMERIC NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
     )
   `);
 
@@ -141,9 +176,24 @@ async function initDatabase() {
   console.log('✅ PostgreSQL 数据库初始化完成');
 }
 
+// ─── 价格计算（LMSR 简化版）────────────────────────────────────────────────────
+// 基于当前 yes/no 票数计算隐含概率（市场价格）
+function calcPrice(yesVotes, noVotes) {
+  const total = yesVotes + noVotes;
+  if (total === 0) return { yes: 0.5, no: 0.5 };
+  return {
+    yes: parseFloat((yesVotes / total).toFixed(4)),
+    no: parseFloat((noVotes / total).toFixed(4))
+  };
+}
+
+function calcOptionPrice(optionVotes, totalVotes) {
+  if (totalVotes === 0) return 0.5;
+  return parseFloat((optionVotes / totalVotes).toFixed(4));
+}
+
 // ─── 中间件 ────────────────────────────────────────────────────────────────
 
-// 普通认证中间件
 const auth = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: '未登录' });
@@ -156,7 +206,6 @@ const auth = (req, res, next) => {
   }
 };
 
-// 管理员认证中间件
 const adminAuth = async (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: '未登录' });
@@ -175,7 +224,6 @@ const adminAuth = async (req, res, next) => {
 
 // ─── 用户相关 ───────────────────────────────────────────────────────────────
 
-// 注册
 app.post('/api/register', async (req, res) => {
   const { email, password, role = 'other' } = req.body;
   if (!email || !password) {
@@ -195,7 +243,6 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
-// 登录
 app.post('/api/login', async (req, res) => {
   const { email, password } = req.body;
   try {
@@ -210,7 +257,6 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// 获取当前用户信息
 app.get('/api/me', auth, async (req, res) => {
   try {
     const user = await db.get('SELECT id, email, credits, role, bio, is_admin FROM users WHERE id = $1', [req.userId]);
@@ -221,7 +267,6 @@ app.get('/api/me', auth, async (req, res) => {
   }
 });
 
-// 更新用户资料
 app.put('/api/me', auth, async (req, res) => {
   const { role, bio } = req.body;
   try {
@@ -232,7 +277,6 @@ app.put('/api/me', auth, async (req, res) => {
   }
 });
 
-// 获取用户主页
 app.get('/api/users/:id', async (req, res) => {
   try {
     const user = await db.get('SELECT id, email, role, bio, credits FROM users WHERE id = $1', [req.params.id]);
@@ -241,7 +285,7 @@ app.get('/api/users/:id', async (req, res) => {
       SELECT COUNT(*) as total_votes,
       SUM(CASE WHEN v.vote = 'yes' THEN 1 ELSE 0 END) as yes_count,
       SUM(CASE WHEN v.vote = 'no' THEN 1 ELSE 0 END) as no_count
-      FROM votes v WHERE v.user_id = $1
+      FROM votes v WHERE v.user_id = $1 AND v.is_closed = 0
     `, [req.params.id]);
     user.stats = stats || { total_votes: 0, yes_count: 0, no_count: 0 };
     res.json(user);
@@ -252,7 +296,6 @@ app.get('/api/users/:id', async (req, res) => {
 
 // ─── 话题相关 ───────────────────────────────────────────────────────────────
 
-// 获取话题列表（带热度排序 + 搜索 + 分类筛选）
 app.get('/api/topics', async (req, res) => {
   const { category, sort = 'hot', search } = req.query;
   let query = `
@@ -275,11 +318,7 @@ app.get('/api/topics', async (req, res) => {
     paramIdx += 2;
   }
   if (conditions.length > 0) query += ' WHERE ' + conditions.join(' AND ');
-  if (sort === 'hot') {
-    query += ' ORDER BY hotness DESC, t.created_at DESC';
-  } else {
-    query += ' ORDER BY t.created_at DESC';
-  }
+  query += sort === 'hot' ? ' ORDER BY hotness DESC, t.created_at DESC' : ' ORDER BY t.created_at DESC';
 
   try {
     const topics = await db.all(query, params);
@@ -289,22 +328,36 @@ app.get('/api/topics', async (req, res) => {
   }
 });
 
-// 创建话题
+// 创建话题（支持 binary 和 multi 两种类型）
 app.post('/api/topics', auth, async (req, res) => {
-  const { title, description, category = 'other', settlement_date } = req.body;
+  const { title, description, category = 'other', settlement_date, topic_type = 'binary', options = [] } = req.body;
   if (!title) return res.status(400).json({ error: '标题不能为空' });
+  if (topic_type === 'multi' && options.length < 2) {
+    return res.status(400).json({ error: '多选项话题至少需要2个选项' });
+  }
   try {
     const result = await db.query(
-      'INSERT INTO topics (title, description, category, settlement_date, creator_id) VALUES ($1, $2, $3, $4, $5) RETURNING id',
-      [title, description, category, settlement_date, req.userId]
+      'INSERT INTO topics (title, description, category, settlement_date, creator_id, topic_type) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
+      [title, description, category, settlement_date, req.userId, topic_type]
     );
-    res.json({ id: result.rows[0].id, title, description, category });
+    const topicId = result.rows[0].id;
+
+    if (topic_type === 'multi') {
+      for (let i = 0; i < options.length; i++) {
+        await db.query(
+          'INSERT INTO topic_options (topic_id, label, display_order) VALUES ($1, $2, $3)',
+          [topicId, options[i], i]
+        );
+      }
+    }
+
+    res.json({ id: topicId, title, description, category, topic_type });
   } catch (err) {
     res.status(500).json({ error: '创建失败' });
   }
 });
 
-// 获取话题详情
+// 获取话题详情（含选项、当前价格、用户持仓）
 app.get('/api/topics/:id', async (req, res) => {
   try {
     const topic = await db.get(`
@@ -314,6 +367,23 @@ app.get('/api/topics/:id', async (req, res) => {
       WHERE t.id = $1
     `, [req.params.id]);
     if (!topic) return res.status(404).json({ error: '话题不存在' });
+
+    // 附加选项（multi 类型）
+    if (topic.topic_type === 'multi') {
+      topic.options = await db.all(
+        'SELECT * FROM topic_options WHERE topic_id = $1 ORDER BY display_order',
+        [req.params.id]
+      );
+      const totalOptionVotes = topic.options.reduce((s, o) => s + (o.vote_count || 0), 0);
+      topic.options = topic.options.map(o => ({
+        ...o,
+        price: calcOptionPrice(o.vote_count, totalOptionVotes)
+      }));
+    }
+
+    // 附加当前市场价格
+    topic.prices = calcPrice(topic.yes_votes, topic.no_votes);
+
     res.json(topic);
   } catch (err) {
     res.status(500).json({ error: '获取失败' });
@@ -334,11 +404,60 @@ app.put('/api/topics/:id', adminAuth, async (req, res) => {
   }
 });
 
-// 投票
+// 获取用户在某话题的持仓
+app.get('/api/topics/:id/position', auth, async (req, res) => {
+  try {
+    const votes = await db.all(`
+      SELECT v.*, o.label as option_label
+      FROM votes v
+      LEFT JOIN topic_options o ON v.option_id = o.id
+      WHERE v.topic_id = $1 AND v.user_id = $2
+      ORDER BY v.created_at ASC
+    `, [req.params.id, req.userId]);
+
+    const topic = await db.get('SELECT yes_votes, no_votes, topic_type FROM topics WHERE id = $1', [req.params.id]);
+    const prices = calcPrice(topic.yes_votes, topic.no_votes);
+
+    // 汇总持仓
+    const positions = {};
+    for (const v of votes) {
+      if (v.is_closed) continue;
+      const key = v.option_id ? `option_${v.option_id}` : v.vote;
+      if (!positions[key]) {
+        positions[key] = {
+          vote: v.vote,
+          option_id: v.option_id,
+          option_label: v.option_label,
+          total_credits: 0,
+          total_shares: 0,
+          avg_price: 0
+        };
+      }
+      positions[key].total_credits += v.credits_spent;
+      positions[key].total_shares += parseFloat(v.shares);
+    }
+
+    // 计算均价和当前市值
+    const positionList = Object.values(positions).map(p => {
+      p.avg_price = p.total_shares > 0 ? p.total_credits / p.total_shares / 10 : 0;
+      const currentPrice = p.option_id ? 0.5 : prices[p.vote];
+      p.current_price = currentPrice;
+      p.current_value = Math.round(p.total_shares * currentPrice * 10);
+      p.pnl = p.current_value - p.total_credits;
+      return p;
+    });
+
+    res.json({ positions: positionList, prices });
+  } catch (err) {
+    res.status(500).json({ error: '获取失败' });
+  }
+});
+
+// ─── 投票（首次建仓）────────────────────────────────────────────────────────
+
 app.post('/api/topics/:id/vote', auth, async (req, res) => {
-  const { vote } = req.body;
+  const { vote, option_id, credits = 10 } = req.body;
   const topicId = req.params.id;
-  if (!['yes', 'no'].includes(vote)) return res.status(400).json({ error: '无效的投票' });
 
   try {
     const topic = await db.get('SELECT * FROM topics WHERE id = $1', [topicId]);
@@ -347,35 +466,212 @@ app.post('/api/topics/:id/vote', auth, async (req, res) => {
 
     const user = await db.get('SELECT credits FROM users WHERE id = $1', [req.userId]);
     if (!user) return res.status(404).json({ error: '用户不存在' });
-    if (user.credits < 10) return res.status(400).json({ error: '积分不足' });
 
-    const existingVote = await db.get('SELECT * FROM votes WHERE topic_id = $1 AND user_id = $2', [topicId, req.userId]);
-    if (existingVote) return res.status(400).json({ error: '已经投过票了' });
+    const betCredits = Math.max(10, parseInt(credits) || 10);
+    if (user.credits < betCredits) return res.status(400).json({ error: '积分不足' });
 
-    await db.run('INSERT INTO votes (topic_id, user_id, vote) VALUES ($1, $2, $3)', [topicId, req.userId, vote]);
+    if (topic.topic_type === 'multi') {
+      // 多选项话题
+      if (!option_id) return res.status(400).json({ error: '请选择一个选项' });
+      const option = await db.get('SELECT * FROM topic_options WHERE id = $1 AND topic_id = $2', [option_id, topicId]);
+      if (!option) return res.status(400).json({ error: '选项不存在' });
 
-    const voteField = vote === 'yes' ? 'yes_votes' : 'no_votes';
-    await db.run(`UPDATE topics SET ${voteField} = ${voteField} + 1, total_participants = total_participants + 1 WHERE id = $1`, [topicId]);
-    await db.run('UPDATE users SET credits = credits - 10 WHERE id = $1', [req.userId]);
+      // 检查是否已投此选项（允许追加，不允许重复建仓同一选项）
+      const existingVote = await db.get(
+        'SELECT * FROM votes WHERE topic_id = $1 AND user_id = $2 AND option_id = $3 AND is_closed = 0',
+        [topicId, req.userId, option_id]
+      );
 
-    // 记录投票快照
-    const updatedTopic = await db.get('SELECT yes_votes, no_votes FROM topics WHERE id = $1', [topicId]);
-    if (updatedTopic) {
-      await db.run('INSERT INTO vote_snapshots (topic_id, yes_votes, no_votes) VALUES ($1, $2, $3)',
-        [topicId, updatedTopic.yes_votes, updatedTopic.no_votes]);
+      const totalOptionVotes = await db.get('SELECT SUM(vote_count) as total FROM topic_options WHERE topic_id = $1', [topicId]);
+      const totalVotes = parseInt(totalOptionVotes?.total || 0);
+      const currentPrice = calcOptionPrice(option.vote_count, totalVotes);
+      const shares = betCredits / (currentPrice * 10 || 1);
+
+      if (existingVote) {
+        // 追加仓位
+        await db.run(
+          'UPDATE votes SET credits_spent = credits_spent + $1, shares = shares + $2, updated_at = NOW() WHERE id = $3',
+          [betCredits, shares, existingVote.id]
+        );
+        await db.run(
+          'INSERT INTO trades (topic_id, user_id, vote_id, action, vote, option_id, credits, shares, price) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
+          [topicId, req.userId, existingVote.id, 'add', option.label, option_id, betCredits, shares, currentPrice]
+        );
+      } else {
+        // 新建仓
+        const voteResult = await db.query(
+          'INSERT INTO votes (topic_id, user_id, vote, option_id, credits_spent, shares, avg_price) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id',
+          [topicId, req.userId, option.label, option_id, betCredits, shares, currentPrice]
+        );
+        await db.run(
+          'INSERT INTO trades (topic_id, user_id, vote_id, action, vote, option_id, credits, shares, price) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
+          [topicId, req.userId, voteResult.rows[0].id, 'open', option.label, option_id, betCredits, shares, currentPrice]
+        );
+        // 新参与者
+        await db.run('UPDATE topics SET total_participants = total_participants + 1 WHERE id = $1', [topicId]);
+      }
+
+      await db.run('UPDATE topic_options SET vote_count = vote_count + $1 WHERE id = $2', [shares, option_id]);
+      await db.run('UPDATE topics SET total_pool = total_pool + $1 WHERE id = $2', [betCredits, topicId]);
+      await db.run('UPDATE users SET credits = credits - $1 WHERE id = $2', [betCredits, req.userId]);
+
+    } else {
+      // 二元话题（binary）
+      if (!['yes', 'no'].includes(vote)) return res.status(400).json({ error: '无效的投票' });
+
+      const existingVote = await db.get(
+        'SELECT * FROM votes WHERE topic_id = $1 AND user_id = $2 AND is_closed = 0',
+        [topicId, req.userId]
+      );
+
+      const prices = calcPrice(topic.yes_votes, topic.no_votes);
+      const currentPrice = prices[vote];
+      const shares = betCredits / (currentPrice * 10 || 5);
+
+      if (existingVote) {
+        if (existingVote.vote !== vote) {
+          return res.status(400).json({ error: '已持有反向仓位，请先平仓再建仓' });
+        }
+        // 追加同向仓位
+        await db.run(
+          'UPDATE votes SET credits_spent = credits_spent + $1, shares = shares + $2, updated_at = NOW() WHERE id = $3',
+          [betCredits, shares, existingVote.id]
+        );
+        await db.run(
+          'INSERT INTO trades (topic_id, user_id, vote_id, action, vote, credits, shares, price) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+          [topicId, req.userId, existingVote.id, 'add', vote, betCredits, shares, currentPrice]
+        );
+      } else {
+        // 新建仓
+        const voteResult = await db.query(
+          'INSERT INTO votes (topic_id, user_id, vote, credits_spent, shares, avg_price) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id',
+          [topicId, req.userId, vote, betCredits, shares, currentPrice]
+        );
+        await db.run(
+          'INSERT INTO trades (topic_id, user_id, vote_id, action, vote, credits, shares, price) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+          [topicId, req.userId, voteResult.rows[0].id, 'open', vote, betCredits, shares, currentPrice]
+        );
+        await db.run('UPDATE topics SET total_participants = total_participants + 1 WHERE id = $1', [topicId]);
+      }
+
+      const voteField = vote === 'yes' ? 'yes_votes' : 'no_votes';
+      await db.run(`UPDATE topics SET ${voteField} = ${voteField} + $1, total_pool = total_pool + $2 WHERE id = $3`,
+        [shares, betCredits, topicId]);
+      await db.run('UPDATE users SET credits = credits - $1 WHERE id = $2', [betCredits, req.userId]);
+
+      // 记录快照
+      const updatedTopic = await db.get('SELECT yes_votes, no_votes FROM topics WHERE id = $1', [topicId]);
+      if (updatedTopic) {
+        await db.run('INSERT INTO vote_snapshots (topic_id, yes_votes, no_votes) VALUES ($1, $2, $3)',
+          [topicId, updatedTopic.yes_votes, updatedTopic.no_votes]);
+      }
+
+      // 通知话题创建者
+      if (topic.creator_id && topic.creator_id !== req.userId) {
+        await db.run(
+          `INSERT INTO notifications (user_id, type, topic_id, from_user_id, message) VALUES ($1, 'vote', $2, $3, $4)`,
+          [topic.creator_id, topicId, req.userId, `有人在你的话题「${topic.title.slice(0, 20)}」上投票了`]
+        );
+      }
     }
 
-    // 给话题创建者发通知
-    if (topic.creator_id && topic.creator_id !== req.userId) {
-      await db.run(
-        `INSERT INTO notifications (user_id, type, topic_id, from_user_id, message) VALUES ($1, 'vote', $2, $3, $4)`,
-        [topic.creator_id, topicId, req.userId, `有人在你的话题「${topic.title.slice(0, 20)}...」上投票了`]
+    const updatedUser = await db.get('SELECT credits FROM users WHERE id = $1', [req.userId]);
+    res.json({ success: true, newCredits: updatedUser.credits });
+  } catch (err) {
+    console.error('投票失败:', err);
+    res.status(500).json({ error: '投票失败: ' + err.message });
+  }
+});
+
+// ─── 平仓（卖出持仓）────────────────────────────────────────────────────────
+
+app.post('/api/topics/:id/close-position', auth, async (req, res) => {
+  const { vote, option_id } = req.body;
+  const topicId = req.params.id;
+
+  try {
+    const topic = await db.get('SELECT * FROM topics WHERE id = $1', [topicId]);
+    if (!topic) return res.status(404).json({ error: '话题不存在' });
+    if (topic.status === 'settled') return res.status(400).json({ error: '话题已结算，无法平仓' });
+
+    let existingVote;
+    if (option_id) {
+      existingVote = await db.get(
+        'SELECT * FROM votes WHERE topic_id = $1 AND user_id = $2 AND option_id = $3 AND is_closed = 0',
+        [topicId, req.userId, option_id]
+      );
+    } else {
+      existingVote = await db.get(
+        'SELECT * FROM votes WHERE topic_id = $1 AND user_id = $2 AND vote = $3 AND is_closed = 0',
+        [topicId, req.userId, vote]
       );
     }
 
-    res.json({ success: true, newCredits: user.credits - 10 });
+    if (!existingVote) return res.status(404).json({ error: '没有找到持仓' });
+
+    // 按当前市场价格计算平仓收益
+    let currentPrice;
+    if (option_id) {
+      const option = await db.get('SELECT vote_count FROM topic_options WHERE id = $1', [option_id]);
+      const totalOptionVotes = await db.get('SELECT SUM(vote_count) as total FROM topic_options WHERE topic_id = $1', [topicId]);
+      currentPrice = calcOptionPrice(option.vote_count, parseInt(totalOptionVotes?.total || 0));
+    } else {
+      const prices = calcPrice(topic.yes_votes, topic.no_votes);
+      currentPrice = prices[vote];
+    }
+
+    const shares = parseFloat(existingVote.shares);
+    const returnCredits = Math.round(shares * currentPrice * 10);
+
+    // 平仓：标记为已关闭，退还按市价计算的积分
+    await db.run('UPDATE votes SET is_closed = 1, updated_at = NOW() WHERE id = $1', [existingVote.id]);
+    await db.run('UPDATE users SET credits = credits + $1 WHERE id = $2', [returnCredits, req.userId]);
+
+    // 更新话题票数（减去平仓份额）
+    if (option_id) {
+      await db.run('UPDATE topic_options SET vote_count = GREATEST(0, vote_count - $1) WHERE id = $2', [shares, option_id]);
+    } else {
+      const voteField = vote === 'yes' ? 'yes_votes' : 'no_votes';
+      await db.run(`UPDATE topics SET ${voteField} = GREATEST(0, ${voteField} - $1) WHERE id = $2`, [shares, topicId]);
+    }
+    await db.run('UPDATE topics SET total_pool = GREATEST(0, total_pool - $1) WHERE id = $2',
+      [existingVote.credits_spent, topicId]);
+
+    // 记录交易
+    await db.run(
+      'INSERT INTO trades (topic_id, user_id, vote_id, action, vote, option_id, credits, shares, price) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
+      [topicId, req.userId, existingVote.id, 'close', vote || existingVote.vote, option_id || null, returnCredits, shares, currentPrice]
+    );
+
+    const updatedUser = await db.get('SELECT credits FROM users WHERE id = $1', [req.userId]);
+    const pnl = returnCredits - existingVote.credits_spent;
+    res.json({
+      success: true,
+      returnCredits,
+      pnl,
+      newCredits: updatedUser.credits,
+      message: `平仓成功，获得 ${returnCredits} 积分（${pnl >= 0 ? '+' : ''}${pnl}）`
+    });
   } catch (err) {
-    res.status(500).json({ error: '投票失败' });
+    console.error('平仓失败:', err);
+    res.status(500).json({ error: '平仓失败: ' + err.message });
+  }
+});
+
+// 获取话题交易历史
+app.get('/api/topics/:id/trades', async (req, res) => {
+  try {
+    const trades = await db.all(`
+      SELECT tr.*, u.email as user_email, u.role as user_role
+      FROM trades tr
+      LEFT JOIN users u ON tr.user_id = u.id
+      WHERE tr.topic_id = $1
+      ORDER BY tr.created_at DESC
+      LIMIT 50
+    `, [req.params.id]);
+    res.json(trades);
+  } catch (err) {
+    res.status(500).json({ error: '获取失败' });
   }
 });
 
@@ -409,7 +705,6 @@ app.post('/api/topics/:id/comments', auth, async (req, res) => {
     const commentId = result.rows[0].id;
     const user = await db.get('SELECT email, role FROM users WHERE id = $1', [req.userId]);
 
-    // 解析 @提及
     const mentions = content.match(/@([^\s@]+@[^\s@]+)/g);
     if (mentions) {
       for (const mention of mentions) {
@@ -424,7 +719,6 @@ app.post('/api/topics/:id/comments', auth, async (req, res) => {
       }
     }
 
-    // 给话题创建者发通知
     const topic = await db.get('SELECT creator_id, title FROM topics WHERE id = $1', [topicId]);
     if (topic && topic.creator_id !== req.userId) {
       await db.run(
@@ -450,7 +744,6 @@ app.post('/api/topics/:id/comments', auth, async (req, res) => {
 app.post('/api/users/:id/follow', auth, async (req, res) => {
   const followingId = req.params.id;
   if (followingId == req.userId) return res.status(400).json({ error: '不能关注自己' });
-
   try {
     await db.run('INSERT INTO follows (follower_id, following_id) VALUES ($1, $2)', [req.userId, followingId]);
     const fromUser = await db.get('SELECT email FROM users WHERE id = $1', [req.userId]);
@@ -464,7 +757,6 @@ app.post('/api/users/:id/follow', auth, async (req, res) => {
   }
 });
 
-// 取消关注
 app.delete('/api/users/:id/follow', auth, async (req, res) => {
   try {
     await db.run('DELETE FROM follows WHERE follower_id = $1 AND following_id = $2', [req.userId, req.params.id]);
@@ -492,62 +784,101 @@ app.get('/api/topics/:id/trend', async (req, res) => {
 // ─── 话题结算 ───────────────────────────────────────────────────────────────
 
 app.post('/api/topics/:id/settle', adminAuth, async (req, res) => {
-  const { result } = req.body;
+  const { result, option_id } = req.body;
   const topicId = req.params.id;
-
-  if (!['yes', 'no'].includes(result)) {
-    return res.status(400).json({ error: '结算结果必须是 yes 或 no' });
-  }
 
   try {
     const topic = await db.get('SELECT * FROM topics WHERE id = $1', [topicId]);
     if (!topic) return res.status(404).json({ error: '话题不存在' });
     if (topic.status === 'settled') return res.status(400).json({ error: '话题已经结算过了' });
 
-    const votes = await db.all('SELECT * FROM votes WHERE topic_id = $1', [topicId]);
-    const winners = votes.filter(v => v.vote === result);
-    const losers = votes.filter(v => v.vote !== result);
-    const totalPool = votes.length * 10;
-    const winnerCount = winners.length;
+    if (topic.topic_type === 'multi') {
+      // 多选项结算
+      if (!option_id) return res.status(400).json({ error: '请指定获胜选项' });
+      const winOption = await db.get('SELECT * FROM topic_options WHERE id = $1 AND topic_id = $2', [option_id, topicId]);
+      if (!winOption) return res.status(400).json({ error: '选项不存在' });
 
-    await db.run('UPDATE topics SET status = $1, settlement_result = $2 WHERE id = $3',
-      ['settled', result, topicId]);
+      const allVotes = await db.all('SELECT * FROM votes WHERE topic_id = $1 AND is_closed = 0', [topicId]);
+      const winners = allVotes.filter(v => v.option_id == option_id);
+      const losers = allVotes.filter(v => v.option_id != option_id);
+      const totalPool = allVotes.reduce((s, v) => s + v.credits_spent, 0);
+      const winnerCount = winners.length;
 
-    if (winnerCount === 0) {
-      for (const v of votes) {
-        await db.run('UPDATE users SET credits = credits + 10 WHERE id = $1', [v.user_id]);
+      await db.run('UPDATE topics SET status = $1, settlement_result = $2 WHERE id = $3',
+        ['settled', winOption.label, topicId]);
+
+      if (winnerCount === 0) {
+        for (const v of allVotes) {
+          await db.run('UPDATE users SET credits = credits + $1 WHERE id = $2', [v.credits_spent, v.user_id]);
+        }
+        return res.json({ success: true, message: '无人猜对，已退还所有积分', winners: 0 });
       }
-      return res.json({ success: true, message: '无人猜对，已退还所有积分', winners: 0, reward: 0 });
+
+      const rewardPerShare = totalPool / winners.reduce((s, v) => s + parseFloat(v.shares), 0);
+      for (const v of winners) {
+        const reward = Math.round(parseFloat(v.shares) * rewardPerShare);
+        await db.run('UPDATE users SET credits = credits + $1 WHERE id = $2', [reward, v.user_id]);
+        await db.run(
+          `INSERT INTO notifications (user_id, type, topic_id, message) VALUES ($1, 'settle_win', $2, $3)`,
+          [v.user_id, topicId, `🎉 话题「${topic.title.slice(0, 20)}」已结算，你押中了「${winOption.label}」！获得 ${reward} 积分`]
+        );
+      }
+      for (const v of losers) {
+        await db.run(
+          `INSERT INTO notifications (user_id, type, topic_id, message) VALUES ($1, 'settle_lose', $2, $3)`,
+          [v.user_id, topicId, `话题「${topic.title.slice(0, 20)}」已结算，获胜选项是「${winOption.label}」，很遗憾你没有猜对`]
+        );
+      }
+      res.json({ success: true, message: `结算完成！获胜选项：${winOption.label}，${winnerCount} 人猜对`, winners: winnerCount });
+
+    } else {
+      // 二元结算
+      if (!['yes', 'no'].includes(result)) {
+        return res.status(400).json({ error: '结算结果必须是 yes 或 no' });
+      }
+
+      const votes = await db.all('SELECT * FROM votes WHERE topic_id = $1 AND is_closed = 0', [topicId]);
+      const winners = votes.filter(v => v.vote === result);
+      const losers = votes.filter(v => v.vote !== result);
+      const totalPool = votes.reduce((s, v) => s + v.credits_spent, 0);
+      const winnerCount = winners.length;
+
+      await db.run('UPDATE topics SET status = $1, settlement_result = $2 WHERE id = $3',
+        ['settled', result, topicId]);
+
+      if (winnerCount === 0) {
+        for (const v of votes) {
+          await db.run('UPDATE users SET credits = credits + $1 WHERE id = $2', [v.credits_spent, v.user_id]);
+        }
+        return res.json({ success: true, message: '无人猜对，已退还所有积分', winners: 0, reward: 0 });
+      }
+
+      const totalWinnerShares = winners.reduce((s, v) => s + parseFloat(v.shares), 0);
+      const rewardPerShare = totalPool / totalWinnerShares;
+
+      for (const v of winners) {
+        const bonus = Math.round(parseFloat(v.shares) * rewardPerShare);
+        await db.run('UPDATE users SET credits = credits + $1 WHERE id = $2', [bonus, v.user_id]);
+        await db.run(
+          `INSERT INTO notifications (user_id, type, topic_id, message) VALUES ($1, 'settle_win', $2, $3)`,
+          [v.user_id, topicId, `🎉 话题「${topic.title.slice(0, 20)}」已结算，你猜对了！获得 ${bonus} 积分`]
+        );
+      }
+      for (const v of losers) {
+        await db.run(
+          `INSERT INTO notifications (user_id, type, topic_id, message) VALUES ($1, 'settle_lose', $2, $3)`,
+          [v.user_id, topicId, `话题「${topic.title.slice(0, 20)}」已结算，很遗憾你没有猜对`]
+        );
+      }
+
+      res.json({
+        success: true,
+        message: `结算完成！${winnerCount} 人猜对`,
+        winners: winnerCount,
+        losers: losers.length,
+        totalPool
+      });
     }
-
-    const rewardPerWinner = Math.floor(totalPool / winnerCount);
-    const remainder = totalPool - rewardPerWinner * winnerCount;
-
-    for (let idx = 0; idx < winners.length; idx++) {
-      const v = winners[idx];
-      const bonus = idx === 0 ? rewardPerWinner + remainder : rewardPerWinner;
-      await db.run('UPDATE users SET credits = credits + $1 WHERE id = $2', [bonus, v.user_id]);
-      await db.run(
-        `INSERT INTO notifications (user_id, type, topic_id, message) VALUES ($1, 'settle_win', $2, $3)`,
-        [v.user_id, topicId, `🎉 话题「${topic.title.slice(0, 20)}」已结算，你猜对了！获得 ${bonus} 积分`]
-      );
-    }
-
-    for (const v of losers) {
-      await db.run(
-        `INSERT INTO notifications (user_id, type, topic_id, message) VALUES ($1, 'settle_lose', $2, $3)`,
-        [v.user_id, topicId, `话题「${topic.title.slice(0, 20)}」已结算，很遗憾你没有猜对`]
-      );
-    }
-
-    res.json({
-      success: true,
-      message: `结算完成！${winnerCount} 人猜对，每人获得 ${rewardPerWinner} 积分`,
-      winners: winnerCount,
-      losers: losers.length,
-      rewardPerWinner,
-      totalPool
-    });
   } catch (err) {
     res.status(500).json({ error: '结算失败: ' + err.message });
   }
@@ -560,17 +891,16 @@ app.get('/api/leaderboard', async (req, res) => {
     const users = await db.all(`
       SELECT u.id, u.email, u.role, u.credits,
         COUNT(v.id) as total_votes,
-        SUM(CASE WHEN v.vote = 'yes' THEN 1 ELSE 0 END) as yes_count,
         (SELECT COUNT(*) FROM votes v2
           JOIN topics t ON v2.topic_id = t.id
-          WHERE v2.user_id = u.id AND t.status = 'settled' AND v2.vote = t.settlement_result
+          WHERE v2.user_id = u.id AND t.status = 'settled' AND v2.vote = t.settlement_result AND v2.is_closed = 0
         ) as correct_count,
         (SELECT COUNT(*) FROM votes v3
           JOIN topics t ON v3.topic_id = t.id
-          WHERE v3.user_id = u.id AND t.status = 'settled'
+          WHERE v3.user_id = u.id AND t.status = 'settled' AND v3.is_closed = 0
         ) as settled_votes
       FROM users u
-      LEFT JOIN votes v ON u.id = v.user_id
+      LEFT JOIN votes v ON u.id = v.user_id AND v.is_closed = 0
       GROUP BY u.id
       ORDER BY u.credits DESC
       LIMIT 50
@@ -632,7 +962,7 @@ app.get('/api/admin/topics', adminAuth, async (req, res) => {
   try {
     const topics = await db.all(`
       SELECT t.*, u.email as creator_email,
-      (SELECT COUNT(*) FROM votes WHERE topic_id = t.id) as vote_count
+      (SELECT COUNT(*) FROM votes WHERE topic_id = t.id AND is_closed = 0) as vote_count
       FROM topics t
       LEFT JOIN users u ON t.creator_id = u.id
       ORDER BY t.created_at DESC
@@ -649,7 +979,7 @@ app.get('/api/admin/users', adminAuth, async (req, res) => {
       SELECT u.id, u.email, u.role, u.credits, u.is_admin, u.created_at,
       COUNT(v.id) as total_votes
       FROM users u
-      LEFT JOIN votes v ON u.id = v.user_id
+      LEFT JOIN votes v ON u.id = v.user_id AND v.is_closed = 0
       GROUP BY u.id
       ORDER BY u.created_at DESC
     `, []);
@@ -693,18 +1023,18 @@ app.put('/api/admin/users/:id/admin', adminAuth, async (req, res) => {
 app.get('/api/export/topics', adminAuth, async (req, res) => {
   try {
     const topics = await db.all(`
-      SELECT t.id, t.title, t.category, t.yes_votes, t.no_votes, t.total_participants,
-      t.status, t.settlement_result, t.settlement_date, t.created_at,
+      SELECT t.id, t.title, t.category, t.topic_type, t.yes_votes, t.no_votes, t.total_participants,
+      t.total_pool, t.status, t.settlement_result, t.settlement_date, t.created_at,
       u.email as creator_email
       FROM topics t
       LEFT JOIN users u ON t.creator_id = u.id
       ORDER BY t.created_at DESC
     `, []);
 
-    const headers = ['ID', '标题', '分类', '看涨票数', '看跌票数', '参与人数', '状态', '结算结果', '结算日期', '创建时间', '创建者'];
+    const headers = ['ID', '标题', '分类', '类型', '看涨票数', '看跌票数', '参与人数', '总积分池', '状态', '结算结果', '结算日期', '创建时间', '创建者'];
     const rows = topics.map(t => [
-      t.id, `"${(t.title || '').replace(/"/g, '""')}"`, t.category,
-      t.yes_votes, t.no_votes, t.total_participants,
+      t.id, `"${(t.title || '').replace(/"/g, '""')}"`, t.category, t.topic_type,
+      t.yes_votes, t.no_votes, t.total_participants, t.total_pool,
       t.status, t.settlement_result || '', t.settlement_date || '', t.created_at, t.creator_email || ''
     ]);
 
@@ -723,7 +1053,7 @@ app.get('/api/export/users', adminAuth, async (req, res) => {
       SELECT u.id, u.email, u.role, u.credits, u.created_at,
       COUNT(v.id) as total_votes
       FROM users u
-      LEFT JOIN votes v ON u.id = v.user_id
+      LEFT JOIN votes v ON u.id = v.user_id AND v.is_closed = 0
       GROUP BY u.id
       ORDER BY u.credits DESC
     `, []);

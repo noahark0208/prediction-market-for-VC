@@ -14,21 +14,41 @@ export function CreateTopicModal({ onClose, onCreate }) {
   const [description, setDescription] = useState('');
   const [category, setCategory] = useState('financing');
   const [settlementDate, setSettlementDate] = useState('');
+  const [topicType, setTopicType] = useState('binary'); // binary | multi
+  const [options, setOptions] = useState(['', '']); // 多选项内容
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!title.trim()) return setError('请填写预测主题');
+    if (topicType === 'multi') {
+      const validOptions = options.map(o => o.trim()).filter(Boolean);
+      if (validOptions.length < 2) return setError('多选项话题至少需要 2 个有效选项');
+    }
     setError('');
     setLoading(true);
     try {
-      await onCreate(title.trim(), description.trim(), category, settlementDate || null);
+      const validOptions = options.map(o => o.trim()).filter(Boolean);
+      await onCreate(title.trim(), description.trim(), category, settlementDate || null, topicType, validOptions);
     } catch (err) {
       setError(err.message || '创建失败，请重试');
     } finally {
       setLoading(false);
     }
+  };
+
+  const addOption = () => {
+    if (options.length < 8) setOptions(prev => [...prev, '']);
+  };
+
+  const removeOption = (idx) => {
+    if (options.length <= 2) return;
+    setOptions(prev => prev.filter((_, i) => i !== idx));
+  };
+
+  const updateOption = (idx, val) => {
+    setOptions(prev => prev.map((o, i) => i === idx ? val : o));
   };
 
   const minDate = new Date();
@@ -37,9 +57,9 @@ export function CreateTopicModal({ onClose, onCreate }) {
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-      <div className="bg-white rounded-2xl w-full max-w-lg shadow-2xl overflow-hidden">
+      <div className="bg-white rounded-2xl w-full max-w-lg shadow-2xl overflow-hidden max-h-[90vh] flex flex-col">
         {/* Header */}
-        <div className="bg-gradient-to-r from-blue-600 to-purple-600 px-6 py-5 text-white">
+        <div className="bg-gradient-to-r from-blue-600 to-purple-600 px-6 py-5 text-white shrink-0">
           <div className="flex items-center justify-between">
             <div>
               <h2 className="text-lg font-bold">发起新预测</h2>
@@ -53,8 +73,40 @@ export function CreateTopicModal({ onClose, onCreate }) {
         </div>
 
         {/* Form */}
-        <div className="p-6">
+        <div className="p-6 overflow-y-auto flex-1">
           <form onSubmit={handleSubmit} className="space-y-4">
+
+            {/* 话题类型选择 */}
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-2">话题类型</label>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => setTopicType('binary')}
+                  className={`p-3 rounded-xl border-2 transition text-left ${
+                    topicType === 'binary'
+                      ? 'border-blue-500 bg-blue-50'
+                      : 'border-gray-200 hover:border-gray-300'
+                  }`}
+                >
+                  <div className="text-sm font-semibold text-gray-800">📊 二元预测</div>
+                  <div className="text-xs text-gray-500 mt-0.5">看涨 vs 看跌，是 vs 否</div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTopicType('multi')}
+                  className={`p-3 rounded-xl border-2 transition text-left ${
+                    topicType === 'multi'
+                      ? 'border-purple-500 bg-purple-50'
+                      : 'border-gray-200 hover:border-gray-300'
+                  }`}
+                >
+                  <div className="text-sm font-semibold text-gray-800">🎯 多选项预测</div>
+                  <div className="text-xs text-gray-500 mt-0.5">多个选项，押注哪个成真</div>
+                </button>
+              </div>
+            </div>
+
             {/* Title */}
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1.5">
@@ -64,13 +116,56 @@ export function CreateTopicModal({ onClose, onCreate }) {
                 type="text"
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
-                placeholder="例如：燧原科技能否在2026年上市？"
+                placeholder={topicType === 'multi' ? '例如：2026年单deal回报最高的基金是哪家？' : '例如：燧原科技能否在2026年上市？'}
                 className="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 transition text-sm"
                 maxLength={100}
                 required
               />
               <div className="text-xs text-gray-400 mt-1 text-right">{title.length}/100</div>
             </div>
+
+            {/* 多选项输入 */}
+            {topicType === 'multi' && (
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  选项列表 <span className="text-red-500">*</span>
+                  <span className="text-gray-400 font-normal ml-1">（2-8个）</span>
+                </label>
+                <div className="space-y-2">
+                  {options.map((opt, idx) => (
+                    <div key={idx} className="flex items-center gap-2">
+                      <div className="w-6 h-6 rounded-full bg-purple-100 text-purple-700 text-xs font-bold flex items-center justify-center shrink-0">
+                        {idx + 1}
+                      </div>
+                      <input
+                        type="text"
+                        value={opt}
+                        onChange={e => updateOption(idx, e.target.value)}
+                        placeholder={`选项 ${idx + 1}，例如：红杉中国`}
+                        className="flex-1 px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 focus:ring-2 focus:ring-purple-100 transition text-sm"
+                        maxLength={30}
+                      />
+                      {options.length > 2 && (
+                        <button
+                          type="button"
+                          onClick={() => removeOption(idx)}
+                          className="w-7 h-7 flex items-center justify-center text-gray-400 hover:text-red-500 transition text-lg"
+                        >×</button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                {options.length < 8 && (
+                  <button
+                    type="button"
+                    onClick={addOption}
+                    className="mt-2 text-sm text-purple-600 hover:text-purple-700 flex items-center gap-1 font-medium"
+                  >
+                    + 添加选项
+                  </button>
+                )}
+              </div>
+            )}
 
             {/* Category */}
             <div>
@@ -120,7 +215,7 @@ export function CreateTopicModal({ onClose, onCreate }) {
                 min={minDateStr}
                 className="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 transition text-sm"
               />
-              <p className="text-xs text-gray-400 mt-1">到期后管理员可手动结算，胜者瓜分积分</p>
+              <p className="text-xs text-gray-400 mt-1">到期后管理员可手动结算，胜者瓜分积分池</p>
             </div>
 
             {/* Error */}

@@ -114,11 +114,11 @@ function App() {
     setUnreadCount(0);
   };
 
-  const handleCreateTopic = async (title, description, category, settlement_date) => {
+  const handleCreateTopic = async (title, description, category, settlement_date, topic_type = 'binary', options = []) => {
     try {
       const token = localStorage.getItem('token');
       await axios.post(`${API_URL}/topics`,
-        { title, description, category, settlement_date },
+        { title, description, category, settlement_date, topic_type, options },
         { headers: { Authorization: `Bearer ${token}` } }
       );
       setShowCreateTopic(false);

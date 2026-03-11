@@ -102,6 +102,7 @@ export function TopicList({ topics, onSelectTopic, selectedCategory, onCategoryC
 }
 
 function TopicCard({ topic, onClick }) {
+  const isMulti = topic.topic_type === 'multi';
   const total = topic.yes_votes + topic.no_votes;
   const yesPercent = total > 0 ? Math.round((topic.yes_votes / total) * 100) : 50;
   const noPercent = 100 - yesPercent;
@@ -112,6 +113,11 @@ function TopicCard({ topic, onClick }) {
     financing: '💰', ipo: '📈', valuation: '💎',
     trend: '🔥', gossip: '💬', other: '📌'
   }[topic.category] || '📌';
+
+  // 多选项：计算各选项百分比
+  const options = topic.options || [];
+  const optionTotal = options.reduce((s, o) => s + (o.vote_count || 0), 0);
+  const optionColors = ['bg-blue-500', 'bg-purple-500', 'bg-orange-400', 'bg-teal-500', 'bg-pink-500', 'bg-yellow-500', 'bg-red-400', 'bg-green-500'];
 
   return (
     <div
@@ -131,13 +137,14 @@ function TopicCard({ topic, onClick }) {
               <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${roleInfo.bg} ${roleInfo.text}`}>
                 {roleInfo.label}
               </span>
+              {isMulti && (
+                <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-indigo-100 text-indigo-700">
+                  🎯 多选项
+                </span>
+              )}
               {isSettled && (
-                <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-                  topic.settlement_result === 'yes'
-                    ? 'bg-green-100 text-green-700'
-                    : 'bg-red-100 text-red-700'
-                }`}>
-                  已结算 · {topic.settlement_result === 'yes' ? '看涨成立' : '看跌成立'}
+                <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-green-100 text-green-700">
+                  ✓ 已结算 · {topic.settlement_result}
                 </span>
               )}
             </div>
@@ -155,37 +162,60 @@ function TopicCard({ topic, onClick }) {
           <p className="text-xs text-gray-500 mb-3 line-clamp-1 leading-relaxed">{topic.description}</p>
         )}
 
-        {/* Progress Bar */}
-        <div className="h-2 bg-gray-100 rounded-full overflow-hidden mb-2">
-          <div className="h-full flex">
-            <div
-              className="bg-green-500 transition-all duration-500"
-              style={{ width: `${yesPercent}%` }}
-            />
-            <div
-              className="bg-red-400 transition-all duration-500"
-              style={{ width: `${noPercent}%` }}
-            />
+        {isMulti && options.length > 0 ? (
+          /* 多选项进度条 */
+          <div className="space-y-1.5 mb-2">
+            {options.slice(0, 3).map((opt, idx) => {
+              const pct = optionTotal > 0 ? Math.round((opt.vote_count / optionTotal) * 100) : Math.round(100 / options.length);
+              return (
+                <div key={opt.id || idx} className="flex items-center gap-2">
+                  <span className="text-xs text-gray-500 w-16 truncate shrink-0">{opt.label}</span>
+                  <div className="flex-1 h-1.5 bg-gray-100 rounded-full overflow-hidden">
+                    <div className={`h-full ${optionColors[idx % optionColors.length]} transition-all duration-500`} style={{ width: `${pct}%` }} />
+                  </div>
+                  <span className="text-xs font-bold text-gray-600 w-8 text-right shrink-0">{pct}%</span>
+                </div>
+              );
+            })}
+            {options.length > 3 && (
+              <div className="text-xs text-gray-400">+{options.length - 3} 个选项</div>
+            )}
           </div>
-        </div>
+        ) : (
+          /* 二元进度条 */
+          <>
+            <div className="h-2 bg-gray-100 rounded-full overflow-hidden mb-2">
+              <div className="h-full flex">
+                <div className="bg-green-500 transition-all duration-500" style={{ width: `${yesPercent}%` }} />
+                <div className="bg-red-400 transition-all duration-500" style={{ width: `${noPercent}%` }} />
+              </div>
+            </div>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="flex items-center gap-1">
+                  <span className="text-base font-bold text-green-600">{yesPercent}%</span>
+                  <span className="text-xs text-gray-400">看涨</span>
+                </div>
+                <div className="w-px h-3 bg-gray-200"></div>
+                <div className="flex items-center gap-1">
+                  <span className="text-base font-bold text-red-500">{noPercent}%</span>
+                  <span className="text-xs text-gray-400">看跌</span>
+                </div>
+              </div>
+              <span className="text-xs text-gray-400">
+                {new Date(topic.created_at).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' })}
+              </span>
+            </div>
+          </>
+        )}
 
-        {/* Stats Row */}
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="flex items-center gap-1">
-              <span className="text-base font-bold text-green-600">{yesPercent}%</span>
-              <span className="text-xs text-gray-400">看涨</span>
-            </div>
-            <div className="w-px h-3 bg-gray-200"></div>
-            <div className="flex items-center gap-1">
-              <span className="text-base font-bold text-red-500">{noPercent}%</span>
-              <span className="text-xs text-gray-400">看跌</span>
-            </div>
+        {isMulti && (
+          <div className="flex justify-end mt-1">
+            <span className="text-xs text-gray-400">
+              {new Date(topic.created_at).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' })}
+            </span>
           </div>
-          <span className="text-xs text-gray-400">
-            {new Date(topic.created_at).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' })}
-          </span>
-        </div>
+        )}
       </div>
     </div>
   );
