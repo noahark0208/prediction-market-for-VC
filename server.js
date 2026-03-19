@@ -486,7 +486,8 @@ app.post('/api/topics/:id/vote', auth, async (req, res) => {
       const totalOptionVotes = await db.get('SELECT SUM(vote_count) as total FROM topic_options WHERE topic_id = $1', [topicId]);
       const totalVotes = parseInt(totalOptionVotes?.total || 0);
       const currentPrice = calcOptionPrice(option.vote_count, totalVotes);
-      const shares = betCredits / (currentPrice * 10 || 1);
+      // 1积分 = 1股，价格只影响赔率，不影响股数
+      const shares = betCredits;
 
       if (existingVote) {
         // 追加仓位
@@ -527,7 +528,8 @@ app.post('/api/topics/:id/vote', auth, async (req, res) => {
 
       const prices = calcPrice(topic.yes_votes, topic.no_votes);
       const currentPrice = prices[vote];
-      const shares = betCredits / (currentPrice * 10 || 5);
+      // 1积分 = 1股，价格只影响赔率，不影响股数
+      const shares = betCredits;
 
       if (existingVote) {
         if (existingVote.vote !== vote) {
